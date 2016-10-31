@@ -4,12 +4,21 @@
 #include <unistd.h>
 #include <rdma/rdma_cma.h>
 
+// x not-zero or not-null , echo error
 #define TEST_NZ(x) do { if ( (x)) die("error: " #x " failed (returned non-zero)." ); } while (0)
+// x null or zero , echo error
 #define TEST_Z(x)  do { if (!(x)) die("error: " #x " failed (returned zero/null)."); } while (0)
 
 const int BUFFER_SIZE = 1024;
-
-struct context {
+/**
+ * we postpone building the verbs context until re receive ur first connextion request because the rdmacm listener ID
+ * isn't necessarily bound to a specific RDMA devic( and associated verbs context).
+ * However , the first connect request we receive will have a valid verbs context structure at id->verbs.
+ * Building the verbs context involves setting up a static context structure, creating a protextion domain, 
+ * creating a completion queue, creating a completion channel, adn starting a thread to pull comoletions from the queue.
+ */
+struct context 
+{
   struct ibv_context *ctx;
   struct ibv_pd *pd;
   struct ibv_cq *cq;
@@ -18,14 +27,20 @@ struct context {
   pthread_t cq_poller_thread;
 };
 
-struct connection {
-  struct ibv_qp *qp;
+/**
+ * when we receive a connection request , we first build our verbs context if it hasn't already been built.
+ * Then, after building our connection context structure,
+ * we pre-post our receives(more on the si a bit),and accept the connection request.
+ */
+struct connection 
+{
+  struct ibv_qp *qp;          // pointer to the queue pair(redundant, but simplifies the code lightly)
 
-  struct ibv_mr *recv_mr;
-  struct ibv_mr *send_mr;
+  struct ibv_mr *recv_mr;     // two buffers
+  struct ibv_mr *send_mr;     
 
-  char *recv_region;
-  char *send_region;
+  char *recv_region;          // two memory regions
+  char *send_region;          // memory used for sends/recieves has tobe "registered" with the verbs library
 };
 
 static void die(const char *reason);
@@ -46,39 +61,58 @@ static struct context *s_ctx = NULL;
 
 int main(int argc, char **argv)
 {
-#if _USE_IPV6
-  struct sockaddr_in6 addr;
-#else
-  struct sockaddr_in addr;
-#endif
-  struct rdma_cm_event *event = NULL;
-  struct rdma_cm_id *listener = NULL;
-  struct rdma_event_channel *ec = NULL;
-  uint16_t port = 0;
+  #if _USE_IPV6
+    struct sockaddr_in6 addr;
+  #else
+    struct sockaddr_in addr;
+  #endif
+    struct rdma_cm_event *event = NULL;
+    struct rdma_cm_id *listener = NULL;
+    struct rdma_event_channel *ec = NULL;
+    uint16_t port = 0;
 
-  memset(&addr, 0, sizeof(addr));
-#if _USE_IPV6
-  addr.sin6_family = AF_INET6;
-#else
-  addr.sin_family = AF_INET;
-#endif
+    memset(&addr, 0, sizeof(addr));
+  #if _USE_IPV6
+    addr.sin6_family = AF_INET6;
+  #else
+    addr.sin_family = AF_INET;
+  #endif
 
+  // create an event channel so thar we can receive rdmacm events,
+  // such as connection-request adn connection-established notifications
   TEST_Z(ec = rdma_create_event_channel());
+
+  //  Allocate a communication identifier.
+  // Notes:
+  // Rdma_cm_id's are conceptually equivalent to a socket for RDMA
+  // communication.  The difference is that RDMA communication requires
+  // explicitly binding to a specified RDMA device before communication
+  // can occur, and most operations are asynchronous in nature.  Communication
+  // events on an rdma_cm_id are reported through the associated event
+  // channel.  Users must release the rdma_cm_id by calling rdma_destroy_id.
   TEST_NZ(rdma_create_id(ec, &listener, NULL, RDMA_PS_TCP));
+
+  // bind the listener ID to an socket address
   TEST_NZ(rdma_bind_addr(listener, (struct sockaddr *)&addr));
+
+  // wait for a connection request
   TEST_NZ(rdma_listen(listener, 10)); /* backlog=10 is arbitrary */
 
   port = ntohs(rdma_get_src_port(listener));
 
   printf("listening on port %d.\n", port);
 
-  while (rdma_get_cm_event(ec, &event) == 0) {
+  // wait in a loop for events
+  // event loop gets an event from rdmacm, acknowledges the event, then process it.
+  while (rdma_get_cm_event(ec, &event) == 0) 
+  {
     struct rdma_cm_event event_copy;
 
     memcpy(&event_copy, event, sizeof(*event));
     rdma_ack_cm_event(event);
 
-    if (on_event(&event_copy))
+    // process the event
+    if (on_event(&event_copy))  
       break;
   }
 
@@ -107,11 +141,16 @@ void build_context(struct ibv_context *verbs)
 
   s_ctx->ctx = verbs;
 
+  // creating a protection domain
   TEST_Z(s_ctx->pd = ibv_alloc_pd(s_ctx->ctx));
+  // creating a completion channel
   TEST_Z(s_ctx->comp_channel = ibv_create_comp_channel(s_ctx->ctx));
+  // creating a completion queue
   TEST_Z(s_ctx->cq = ibv_create_cq(s_ctx->ctx, 10, NULL, s_ctx->comp_channel, 0)); /* cqe=10 is arbitrary */
+  // the poller waits on the channel, acknowledges the completion, rearms the completion queue(with ibv_req_notify_cq()),
+  // the pulls events from the queue until none are left
   TEST_NZ(ibv_req_notify_cq(s_ctx->cq, 0));
-
+  // starting a thread to pull completions from the queue
   TEST_NZ(pthread_create(&s_ctx->cq_poller_thread, NULL, poll_cq, NULL));
 }
 
@@ -119,13 +158,13 @@ void build_qp_attr(struct ibv_qp_init_attr *qp_attr)
 {
   memset(qp_attr, 0, sizeof(*qp_attr));
 
-  qp_attr->send_cq = s_ctx->cq;
+  qp_attr->send_cq = s_ctx->cq; //
   qp_attr->recv_cq = s_ctx->cq;
-  qp_attr->qp_type = IBV_QPT_RC;
+  qp_attr->qp_type = IBV_QPT_RC; //qp_type is set to indicate we want a reliable, connection-oriented queue pair
 
   qp_attr->cap.max_send_wr = 10;
   qp_attr->cap.max_recv_wr = 10;
-  qp_attr->cap.max_send_sge = 1;
+  qp_attr->cap.max_send_sge = 1; // scatter/gather element(SGE; effectively a memory location/size tuple) per send or receive request
   qp_attr->cap.max_recv_sge = 1;
 }
 
@@ -146,11 +185,15 @@ void * poll_cq(void *ctx)
   return NULL;
 }
 
+// The reason it is necessary to post receive work requests(WRs) before accepting the connection is that
+//  the underlying hardware won't buffer incoming message .
+//  if a receive request has not been posted to the work queue, the incoming message is rejected and 
+//  the peer will receive a receiver-not-ready(RNR) error.
 void post_receives(struct connection *conn)
 {
   struct ibv_recv_wr wr, *bad_wr = NULL;
   struct ibv_sge sge;
-
+  // the (arbitrary) wr_id field is used to store a connection context pointer.
   wr.wr_id = (uintptr_t)conn;
   wr.next = NULL;
   wr.sg_list = &sge;
@@ -167,7 +210,7 @@ void register_memory(struct connection *conn)
 {
   conn->send_region = malloc(BUFFER_SIZE);
   conn->recv_region = malloc(BUFFER_SIZE);
-
+  // register send_region and recv_region with verbs. local write and remote write access
   TEST_Z(conn->send_mr = ibv_reg_mr(
     s_ctx->pd,
     conn->send_region,
@@ -204,20 +247,28 @@ int on_connect_request(struct rdma_cm_id *id)
 
   printf("received connection request.\n");
 
+  // when we receive a connection request ,first build the verbs context if it hasn't already been built
   build_context(id->verbs);
+  // After building the verbs context, we have to initialize the queue pair attributes structure.
   build_qp_attr(&qp_attr);
 
+  // create the queue pair
   TEST_NZ(rdma_create_qp(id, s_ctx->pd, &qp_attr));
 
   id->context = conn = (struct connection *)malloc(sizeof(struct connection));
   conn->qp = id->qp;
-
+  // allocate and register memory for our send and receive operations
   register_memory(conn);
+
+  // The reason it is necessary to post receive work requests(WRs) before accepting the connection is that
+  //  the underlying hardware won't buffer incoming message .
+  //  if a receive request has not been posted to the work queue, the incoming message is rejected and 
+  //  the peer will receive a receiver-not-ready(RNR) error.
   post_receives(conn);
 
   memset(&cm_params, 0, sizeof(cm_params));
+  // ready to accept the connect request
   TEST_NZ(rdma_accept(id, &cm_params));
-
   return 0;
 }
 
@@ -268,6 +319,7 @@ int on_disconnect(struct rdma_cm_id *id)
   return 0;
 }
 
+// the event handle for the passive side of the connection is only interested in three events
 int on_event(struct rdma_cm_event *event)
 {
   int r = 0;

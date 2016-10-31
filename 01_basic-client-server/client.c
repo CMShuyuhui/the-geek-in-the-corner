@@ -192,7 +192,7 @@ int on_addr_resolved(struct rdma_cm_id *id)
 
   conn->id = id;
   conn->qp = id->qp;
-  conn->num_completions = 0;
+  conn->num_completions = 0; // use it to keep track of the number of completions we've processed for this connection.
 
   register_memory(conn);
   post_receives(conn);
@@ -271,7 +271,6 @@ int on_disconnect(struct rdma_cm_id *id)
 int on_event(struct rdma_cm_event *event)
 {
   int r = 0;
-
   if (event->event == RDMA_CM_EVENT_ADDR_RESOLVED)
     r = on_addr_resolved(event->id);
   else if (event->event == RDMA_CM_EVENT_ROUTE_RESOLVED)
