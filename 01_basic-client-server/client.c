@@ -64,11 +64,13 @@ int main(int argc, char **argv)
 
   TEST_Z(ec = rdma_create_event_channel());
   TEST_NZ(rdma_create_id(ec, &conn, NULL, RDMA_PS_TCP));
+  // resolve the server's address with rdma_resolve_addr(), passing a pointer to struct sockaddr.
   TEST_NZ(rdma_resolve_addr(conn, NULL, addr->ai_addr, TIMEOUT_IN_MS));
 
   freeaddrinfo(addr);
 
-  while (rdma_get_cm_event(ec, &event) == 0) {
+  while (rdma_get_cm_event(ec, &event) == 0) 
+  {
     struct rdma_cm_event event_copy;
 
     memcpy(&event_copy, event, sizeof(*event));

@@ -41,6 +41,8 @@ struct connection {
   char *rdma_local_region;
   char *rdma_remote_region;
 
+  // send_state and recv_state are used by the completion handler to 
+  // properly sequence messages and RDMA operations between peers.
   enum {
     SS_INIT,
     SS_MR_SENT,
@@ -121,8 +123,12 @@ void build_context(struct ibv_context *verbs)
 void build_params(struct rdma_conn_param *params)
 {
   memset(params, 0, sizeof(*params));
-
+  // Since we're using RDMA read operations, we have to set initiator_depth and
+  // responder_resources in struct rdma_conn_param. These control the number of simultaneous
+  // outstanding RDMA read requests
   params->initiator_depth = params->responder_resources = 1;
+  // we want the adapter to resend indefinitely if the peer responds with a receiver-not-ready(RNR) error.
+  // RNRs happen when a send request is posted before a corresponding receive is posted on the peer.
   params->rnr_retry_count = 7; /* infinite retry */
 }
 
